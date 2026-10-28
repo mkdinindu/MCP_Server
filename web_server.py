@@ -133,112 +133,122 @@ def search_news(query: str, max_results: int = 5) -> str:
 
 
 # ─────────────────────────────────────────────
-# 3. Smart YouTube finder (fuzzy / semantic)
+# 3. YouTube video finder (uses DuckDuckGo web search)
 # ─────────────────────────────────────────────
 
-@mcp.tool()
-def find_youtube_video(description: str, max_results: int = 5) -> str:
-    """
-    Find a YouTube video from a loose, partial, or imprecise description.
-    Examples: "that 80s song about running away", "cooking pasta white wine sauce italian chef",
-              "vsauce episode about gravity", "funny cat piano video".
+_YOUTUBE_WATCH_RE = re.compile(r"youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})")
+_YOUTUBE_SHORT_RE = re.compile(r"youtu\.be/([a-zA-Z0-9_-]{11})")
 
-    Internally runs multiple query variants, deduplicates, scores by relevance,
-    and returns the best matches with title, URL, channel, and duration.
+
+def _youtube_search(description: str, max_results: int) -> list[dict[str, str]]:
+    """
+    Core YouTube search using ddgs.text() with site:youtube.com queries.
+    Returns a list of dicts with keys: title, url, channel, snippet.
+    """
+    base = description.strip()
+    queries = [
+        f'site:youtube.com "{base}"',
+        f"site:youtube.com {base}",
+        f"youtube {base}",
+    ]
+
+    seen_ids: set[str] = set()
+    results: list[dict[str, str]] = []
+
+    with DDGS() as ddgs:
+        for q in queries:
+            try:
+                page = list(ddgs.text(q, max_results=10))
+            except Exception:
+                continue
+
+            for r in page:
+                href = r.get("href", "")
+                vid = None
+                m = _YOUTUBE_WATCH_RE.search(href)
+                if m:
+                    vid = m.group(1)
+                else:
+                    m = _YOUTUBE_SHORT_RE.search(href)
+                    if m:
+                        vid = m.group(1)
+
+                if not vid or vid in seen_ids:
+                    continue
+                seen_ids.add(vid)
+
+                title = r.get("title", "No title")
+                snippet = r.get("body", "")
+                results.append({
+                    "title": title,
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "channel": "",
+                    "snippet": _clean_text(snippet, 200),
+                })
+
+                if len(results) >= max_results:
+                    return results
+
+            if len(results) >= max_results:
+                break
+
+    return results
+
+
+@mcp.tool()
+def search_youtube(description: str, max_results: int = 5) -> str:
+    """
+    Search for YouTube videos matching a description, title, or topic.
+    Use this for any request to find, search, or play YouTube videos.
+
+    Examples:
+      description="despacito", description="never gonna give you up",
+      description="vsauce mind field episode 1", description="pasta recipe
+
+    Returns ranked results with title, URL, and channel.
+    After finding the right video, use play_youtube_video to open it in the browser.
     """
     try:
-        # Build query variants to cast a wide net
-        base = description.strip()
-        queries = [
-            f"{base} site:youtube.com",
-            f"youtube {base}",
-            base,
-        ]
+        results = _youtube_search(description, max_results)
+        if not results:
+            return (
+                f"No YouTube videos found for \"{description}\". "
+                "Try a different description or check your spelling."
+            )
 
-        candidates: dict[str, dict] = {}  # url → result
+        # Score by title similarity to description
+        desc_lower = description.lower()
+        desc_keywords = set(re.findall(r"\w+", desc_lower))
 
-        with DDGS() as ddgs:
-            for q in queries:
-                try:
-                    results = list(ddgs.videos(q, max_results=10, source="youtube"))
-                    for r in results:
-                        url = r.get("content", "")
-                        if url and url not in candidates:
-                            candidates[url] = r
-                except Exception:
-                    pass
-
-            # Fallback: plain text search on YouTube if video search yielded little
-            if len(candidates) < 3:
-                try:
-                    web_results = list(
-                        ddgs.text(
-                            f'site:youtube.com/watch "{base}"',
-                            max_results=8,
-                        )
-                    )
-                    for r in web_results:
-                        url = r.get("href", "")
-                        if "youtube.com/watch" in url and url not in candidates:
-                            candidates[url] = {
-                                "title": r.get("title", ""),
-                                "content": url,
-                                "publisher": "",
-                                "duration": "",
-                                "statistics": {},
-                                "_from_web": True,
-                            }
-                except Exception:
-                    pass
-
-        if not candidates:
-            return "No YouTube videos found for that description."
-
-        # Score each candidate
-        desc_lower = base.lower()
-        keywords = set(re.findall(r"\w+", desc_lower))
-
-        def score(r: dict) -> float:
-            title = r.get("title", "")
-            title_lower = title.lower()
-            # String similarity
+        def score(item: dict) -> float:
+            title_lower = item["title"].lower()
             sim = _similarity(desc_lower, title_lower)
-            # Keyword overlap bonus
             title_words = set(re.findall(r"\w+", title_lower))
-            overlap = len(keywords & title_words) / max(len(keywords), 1)
-            # View count bonus (log-scaled, optional)
-            views = int(r.get("statistics", {}).get("viewCount", 0) or 0)
-            view_bonus = math.log10(views + 1) / 10 if views else 0
-            return sim * 0.5 + overlap * 0.4 + view_bonus * 0.1
+            overlap = len(desc_keywords & title_words) / max(len(desc_keywords), 1)
+            return sim * 0.5 + overlap * 0.5
 
-        ranked = sorted(candidates.values(), key=score, reverse=True)
+        results.sort(key=score, reverse=True)
 
         lines = []
-        for i, r in enumerate(ranked[:max_results], 1):
-            title = r.get("title", "No title")
-            url = r.get("content", "")
-            channel = r.get("publisher", "Unknown channel")
-            duration = r.get("duration", "")
-            views = r.get("statistics", {}).get("viewCount", "")
-
-            meta_parts = []
-            if channel:
-                meta_parts.append(f"Channel: {channel}")
-            if duration:
-                meta_parts.append(f"Duration: {duration}")
-            if views:
-                try:
-                    meta_parts.append(f"Views: {int(views):,}")
-                except Exception:
-                    meta_parts.append(f"Views: {views}")
-
-            meta = "  |  ".join(meta_parts) if meta_parts else ""
-            lines.append(f"[{i}] {title}\n    URL : {url}\n    {meta}")
+        for i, r in enumerate(results[:max_results], 1):
+            lines.append(
+                f"[{i}] {r['title']}\n"
+                f"    URL : {r['url']}\n"
+                f"    Info: {r['snippet']}"
+            )
 
         return "\n\n".join(lines)
 
     except Exception as exc:
         return f"YouTube search failed: {exc}"
+
+
+@mcp.tool()
+def find_youtube_video(description: str, max_results: int = 5) -> str:
+    """
+    [Alias for search_youtube] Find a YouTube video from a partial or fuzzy description.
+    """
+    return search_youtube(description, max_results)
 
 
 # ─────────────────────────────────────────────
